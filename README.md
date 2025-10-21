@@ -2,7 +2,9 @@ Run python .\flappy_bird_v6_play.py
 
 
 root/ <---- OG NEAT : https://github.com/techwithtim/NEAT-Flappy-Bird
+
 │
+
 ├── imgs/                        
 │
 ├── .gitpod.yml                   
