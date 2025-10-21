@@ -8,6 +8,7 @@ Features:
 - Variable pipe heights
 - Color changes as difficulty increases
 """
+
 import pygame
 import random
 import os
@@ -36,6 +37,14 @@ base_img = pygame.transform.scale2x(pygame.image.load(os.path.join("imgs","base.
 
 gen = 0
 
+import os as _os
+_HEADLESS = _os.environ.get("SDL_VIDEODRIVER") == "dummy" or _os.environ.get("FB_NO_DISPLAY") == "1"
+if not _HEADLESS:
+    WIN = pygame.display.set_mode((WIN_WIDTH, WIN_HEIGHT))
+    pygame.display.set_caption("Flappy Bird - Enhanced")
+else:
+    WIN = None  # training doesn't render
+
 class Bird:
     """
     Enhanced Bird class with adaptive mechanics
@@ -57,7 +66,7 @@ class Bird:
 
     def jump(self):
         """Enhanced jump with speed consideration"""
-        self.vel = -2.5
+        self.vel = -7.5
         self.tick_count = 0
         self.height = self.y
 
@@ -114,7 +123,7 @@ class Pipe():
     """
     Enhanced pipe with progressive difficulty
     """
-    INITIAL_GAP = 200
+    INITIAL_GAP = 300
     MIN_GAP = 100
     GAP_DECREASE_RATE = 3  # Pixels to decrease per pipe
     INITIAL_VEL = 5

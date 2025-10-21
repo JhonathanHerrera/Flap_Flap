@@ -17,3 +17,4 @@ graphviz==0.20.3
 
 # Optional: For better performance monitoring
 tqdm==4.66.5
+psutil
