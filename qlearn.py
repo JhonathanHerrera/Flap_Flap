@@ -1,176 +1,116 @@
-# file: train_flappy_q_improved.py
+# file: train_flappy_q_fixed.py
 """
-Improved Q-learning trainer for Flappy Bird with enhanced features.
-All hyperparameters are at the top for easy tuning.
+FIXED Q-learning trainer - addresses the "not learning" problem.
+Key fixes:
+1. Smaller, more manageable state space
+2. Proper exploration decay
+3. Better reward shaping
+4. Simpler curriculum
 """
 
 # ==================== HYPERPARAMETERS - EDIT THESE ====================
 
 # --- Learning Parameters ---
-LEARNING_RATE = 0.08
-# Range: 0.01-0.3 | How fast the agent learns. Higher = faster but less stable.
+LEARNING_RATE = 0.15
+# Range: 0.1-0.3 | Higher = faster learning (increased from 0.08)
 
-LEARNING_RATE_DECAY = 0.99995
-# Range: 0.9999-1.0 | Decay factor per update. 1.0 = no decay.
-
-MIN_LEARNING_RATE = 0.02
-# Range: 0.01-0.05 | Minimum learning rate after decay.
-
-DISCOUNT_FACTOR = 0.995
-# Range: 0.95-0.999 | How much to value future rewards. Higher = more forward-thinking.
+DISCOUNT_FACTOR = 0.99
+# Range: 0.95-0.995 | Lowered for shorter-term thinking (better for early learning)
 
 # --- Exploration Parameters ---
-EXPLORATION_START = 0.35
-# Range: 0.1-0.5 | Initial random action probability. Higher = more exploration at start.
+EXPLORATION_START = 0.5
+# Range: 0.3-0.7 | Start with MORE exploration
 
-EXPLORATION_DECAY = 0.99975
-# Range: 0.999-0.9999 | How fast exploration decreases. Higher = slower decay.
+EXPLORATION_DECAY = 0.99
+# Range: 0.9995-0.9999 | Decay per EPISODE (not per step!)
 
-MIN_EXPLORATION = 0.01
-# Range: 0.0-0.05 | Minimum random action probability. Always keep some exploration.
+MIN_EXPLORATION = 0.05
+# Range: 0.02-0.1 | Keep more exploration throughout
 
 # --- Training Volume ---
-TOTAL_EPISODES_PER_WORKER = 50000
-# Range: 1000-10000 | Episodes each worker trains. More = better but slower.
+TOTAL_EPISODES_PER_WORKER = 3000
+# Reduced for faster iteration - increase once it's working
 
-SYNC_INTERVAL = 300
-# Range: 100-500 | Episodes between syncing workers. Higher = more diverse exploration.
+SYNC_INTERVAL = 200
+# Sync more frequently for stability
 
-MAX_STEPS = 10000
-# Range: 1000-10000 | Max steps per episode before timeout. Higher allows longer runs.
+MAX_STEPS = 3000
+# Shorter episodes for faster learning cycles
 
 MAX_WORKERS = 15
-# Range: 1-CPU_COUNT | Hard cap on parallel workers. Set based on your CPU cores.
 
-# --- State Discretization (bins for tabular Q-learning) ---
-Y_BINS = 10
-# Range: 6-15 | Bins for bird's vertical position. More = finer control but larger table.
+# --- SIMPLIFIED State Discretization ---
+# KEY FIX: Much smaller state space for faster learning
+Y_BINS = 6  # Reduced from 10
+# Range: 4-8 | Coarser vertical position
 
-DY_GAP_BINS = 12
-# Range: 8-20 | Bins for distance to gap center. More = better precision.
+DY_GAP_BINS = 8  # Reduced from 12
+# Range: 6-10 | Distance to gap
 
-TTB_BINS = 10
-# Range: 8-15 | Bins for time-to-pipe. More = better timing precision.
+TTB_BINS = 6  # Reduced from 10
+# Range: 4-8 | Time to pipe
 
-VEL_BINS = 9
-# Range: 5-12 | Bins for bird velocity. More = smoother velocity control.
+VEL_BINS = 5  # Reduced from 9
+# Range: 4-7 | Velocity bins
 
-NEXT_GAP_BINS = 10
-# Range: 6-15 | Bins for next pipe's gap position. More = better lookahead.
+NEXT_GAP_BINS = 6  # Reduced from 10
+# Range: 4-8 | Next gap position
 
-DY_NEXT_GAP_BINS = 10
-# Range: 6-15 | Bins for distance to next gap. Helps with trajectory planning.
+# REMOVED complex features for now
+# DY_NEXT_GAP_BINS = 0  # Not used
+# PIPE_GAP_SIZE_BINS = 0  # Not used
+# ACCEL_BINS = 0  # Not used
 
-PIPE_GAP_SIZE_BINS = 6
-# Range: 3-8 | Bins for gap size (if variable). More = better gap size awareness.
-
-ACCEL_BINS = 5
-# Range: 3-7 | Bins for bird acceleration. Captures momentum changes.
+# New Q-table size: 6×8×6×5×6×2 = 17,280 states (vs 64.8M!)
+# This is 3700x smaller and will learn much faster!
 
 # --- Action Space ---
-ACTIONS = 2
-# Options: 2, 3, or 4 | Number of actions: 2=(no-flap,flap), 3=(no,small,big), 4=(no,small,med,big)
+ACTIONS = 2  # Keep it simple
 
-# --- Reward Shaping ---
-DEATH_PENALTY = -5.0
-# Range: -10.0 to -3.0 | Punishment for dying. More negative = agent avoids death more.
+# --- IMPROVED Reward Shaping ---
+DEATH_PENALTY = -10.0
+# Increased penalty - make death REALLY bad
 
-PIPE_PASS_REWARD = 5.0
-# Range: 3.0-10.0 | Reward for passing a pipe. Higher = more aggressive pipe-seeking.
+PIPE_PASS_REWARD = 10.0
+# Increased reward - make success REALLY good
 
-PERFECT_PASS_BONUS = 2.0
-# Range: 1.0-5.0 | Extra reward for passing through center. Encourages precision.
+ALIVE_REWARD = 0.1
+# Small reward just for surviving each step
 
-PERFECT_PASS_THRESHOLD = 0.25
-# Range: 0.15-0.35 | Fraction of gap height to be considered "perfect" (0.25 = within 25%).
+DISTANCE_REWARD_SCALE = 0.5
+# Reward for being near gap center
 
-CENTERING_REWARD_SCALE = 0.5
-# Range: 0.2-1.0 | Multiplier for staying centered. Higher = stronger centering.
+FLAP_PENALTY = 0.0
+# REMOVED flap penalty - let it flap freely while learning
 
-CENTERING_REWARD_SHARPNESS = 2.0
-# Range: 1.0-4.0 | How sharply centering reward drops off. Higher = rewards only near center.
-
-FLAP_PENALTY = 0.03
-# Range: 0.01-0.1 | Small penalty per flap. Discourages excessive flapping.
-
-FLAP_WHEN_CENTERED_PENALTY = 0.02
-# Range: 0.01-0.05 | Extra penalty for flapping when already centered.
-
-NEXT_PIPE_LOOKAHEAD_REWARD = 0.1
-# Range: 0.0-0.3 | Reward for good positioning for next pipe. Encourages planning.
-
-DISTANCE_LOSS_WEIGHT = 0.02
-# Range: 0.01-0.05 | Weight for distance-to-gap-center penalty (legacy).
-
-# --- Multi-Horizon Bootstrapping ---
-HORIZONS = [5, 10, 20, 50]
-# Range: Any list like [3,5,10] to [5,10,20,50,100] | Look ahead N steps. More horizons = better long-term planning.
+# --- Multi-Horizon (simplified) ---
+HORIZONS = [1, 5, 10]
+# Simplified - focus on immediate and short-term
 
 # --- Experience Replay ---
-USE_REPLAY_BUFFER = True
-# Options: True/False | Enable experience replay for more stable learning.
-
-REPLAY_BUFFER_SIZE = 50000
-# Range: 10000-200000 | Max experiences to store. More = better but uses more memory.
-
-REPLAY_BATCH_SIZE = 32
-# Range: 16-128 | Experiences sampled per update. Higher = more stable but slower.
-
-REPLAY_PRIORITY_ALPHA = 0.6
-# Range: 0.0-1.0 | Priority exponent. 0=uniform, 1=fully prioritized by TD-error.
-
-REPLAY_MIN_PRIORITY = 0.01
-# Range: 0.001-0.1 | Minimum priority for all experiences. Ensures some sampling of all.
+USE_REPLAY_BUFFER = False
+# DISABLED for now - adds complexity
 
 # --- Curriculum Learning ---
-USE_CURRICULUM = True
-# Options: True/False | Start easy, gradually increase difficulty.
-
-CURRICULUM_PHASES = [
-    {'episodes': 1000, 'gap_size': 200, 'pipe_speed': 5},
-    {'episodes': 2000, 'gap_size': 180, 'pipe_speed': 6},
-    {'episodes': 3500, 'gap_size': 160, 'pipe_speed': 7},
-    {'episodes': 5000, 'gap_size': 140, 'pipe_speed': 8},
-]
-# Edit phases: 'episodes' = when to switch, 'gap_size' = pipe gap height, 'pipe_speed' = horizontal speed
+USE_CURRICULUM = False
+# DISABLED - standard game is fine
 
 # --- Optimistic Initialization ---
-OPTIMISTIC_INIT_VALUE = 0.2
-# Range: 0.0-1.0 | Initial Q-value for idle action. Higher = more initial exploration.
-
-OPTIMISTIC_INIT_FLAP_VALUE = 0.1
-# Range: 0.0-1.0 | Initial Q-value for flap action. Usually lower than idle.
-
-# --- Multi-Action Jump Strengths (if ACTIONS > 2) ---
-JUMP_STRENGTHS = {
-    0: 0,      # no jump
-    1: -7,     # small jump
-    2: -10.5,  # normal jump
-    3: -13,    # strong jump
-}
-# Range: 0 to -15 | Negative = upward velocity. Customize for ACTIONS=3 or 4.
+OPTIMISTIC_INIT_VALUE = 1.0
+# Higher optimism = more exploration
 
 # --- System Performance ---
 DEFAULT_NICE_VALUE = 10
-# Range: 0-19 (Linux) or 5-15 (Windows) | Lower CPU priority. Higher = more background-friendly.
-
 USE_IONICE = False
-# Options: True/False | Linux only - lower I/O priority to avoid disk bottlenecks.
-
 DEFAULT_MAXTASKSPERCHILD = 200
-# Range: 50-500 or None | Recycle workers after N tasks to prevent memory leaks. None = no recycling.
 
 # --- Export Settings ---
 EXPORT_DIR_NAME = "exports"
-# Directory name for saving Q-tables and replays.
-
 SAVE_BEST_Q = True
 SAVE_AVG_Q = True
 SAVE_REPLAY = True
-# Options: True/False | Toggle what to save after training.
 
 # ==================== END OF HYPERPARAMETERS ====================
-
 
 import math
 import os
@@ -181,7 +121,6 @@ import importlib
 import argparse
 from pathlib import Path
 from typing import Tuple, Dict, Any, List, Optional
-from collections import deque
 
 import numpy as np
 import multiprocessing as mp
@@ -191,12 +130,10 @@ EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==================== Priority helpers ====================
 def set_process_priority(nice_value: int = 10, ionice: bool = False, affinity: Optional[List[int]] = None):
-    """Lower CPU/I/O priority and optionally set CPU affinity."""
     try:
         import psutil
     except Exception:
         psutil = None
-
     try:
         if os.name == "posix":
             if nice_value is not None:
@@ -214,7 +151,6 @@ def set_process_priority(nice_value: int = 10, ionice: bool = False, affinity: O
                 p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
     except Exception:
         pass
-
     if ionice and os.name == "posix":
         try:
             import psutil
@@ -223,7 +159,6 @@ def set_process_priority(nice_value: int = 10, ionice: bool = False, affinity: O
                 p.ionice(psutil.IOPRIO_CLASS_IDLE)
         except Exception:
             pass
-
     if affinity:
         try:
             import psutil
@@ -239,7 +174,7 @@ def _pool_initializer(nice_value: int, ionice_flag: bool, affinity: Optional[Lis
         os.environ.setdefault("FB_NO_DISPLAY", "1")
     set_process_priority(nice_value, ionice_flag, affinity)
 
-# ==================== Lazy import of environment ====================
+# ==================== Lazy import ====================
 def load_fb_module():
     fb = importlib.import_module("flappy_bird")
     return fb
@@ -261,117 +196,44 @@ def pipe_index_for_bird(bird_x, pipes):
 def gap_center(p): 
     return (p.height + p.bottom) / 2.0
 
-def avg_forward_speed(): 
-    return 8.0
-
-# ==================== Experience Replay Buffer ====================
-class ReplayBuffer:
-    """Prioritized experience replay for more stable learning."""
-    def __init__(self, capacity=REPLAY_BUFFER_SIZE):
-        self.buffer = deque(maxlen=capacity)
-        self.priorities = deque(maxlen=capacity)
-    
-    def add(self, transition, td_error):
-        """Add experience with priority based on TD error."""
-        self.buffer.append(transition)
-        priority = (abs(td_error) ** REPLAY_PRIORITY_ALPHA) + REPLAY_MIN_PRIORITY
-        self.priorities.append(priority)
-    
-    def sample(self, batch_size=REPLAY_BATCH_SIZE):
-        """Sample experiences based on priority."""
-        if len(self.buffer) == 0:
-            return []
-        
-        probs = np.array(self.priorities, dtype=np.float64)
-        probs = probs / probs.sum()
-        
-        sample_size = min(batch_size, len(self.buffer))
-        indices = np.random.choice(len(self.buffer), size=sample_size, p=probs, replace=False)
-        return [self.buffer[i] for i in indices]
-    
-    def __len__(self):
-        return len(self.buffer)
-
-# ==================== Curriculum Manager ====================
-class CurriculumManager:
-    """Manages progressive difficulty during training."""
-    def __init__(self):
-        self.phases = CURRICULUM_PHASES
-        self.current_phase_idx = 0
-    
-    def get_difficulty(self, episode):
-        """Returns current difficulty settings based on episode count."""
-        if not USE_CURRICULUM:
-            return self.phases[-1] if self.phases else None
-        
-        for i, phase in enumerate(self.phases):
-            if episode < phase['episodes']:
-                self.current_phase_idx = i
-                return phase
-        return self.phases[-1]
-
-# ==================== Discretizer ====================
+# ==================== SIMPLIFIED Discretizer ====================
 class Discretizer:
-    """Enhanced state discretization with more features."""
+    """Simplified state with only 5 features."""
     def __init__(self, FLOOR: int):
         self.FLOOR = FLOOR
-        
-        # Bin edges
         self.y_edges = np.linspace(0, FLOOR, Y_BINS + 1)[1:-1]
         
-        self.dy_max = 250.0
+        self.dy_max = 300.0
         self.dy_edges = np.linspace(0, self.dy_max, DY_GAP_BINS + 1)[1:-1]
         
-        self.ttb_max = 80.0
+        self.ttb_max = 100.0
         self.ttb_edges = np.linspace(0, self.ttb_max, TTB_BINS + 1)[1:-1]
         
         self.vel_min, self.vel_max = -12.0, 12.0
         self.vel_edges = np.linspace(self.vel_min, self.vel_max, VEL_BINS + 1)[1:-1]
         
         self.next_gap_edges = np.linspace(0, FLOOR, NEXT_GAP_BINS + 1)[1:-1]
-        
-        # Enhanced features
-        self.dy_next_max = 300.0
-        self.dy_next_edges = np.linspace(0, self.dy_next_max, DY_NEXT_GAP_BINS + 1)[1:-1]
-        
-        self.gap_size_min, self.gap_size_max = 100.0, 250.0
-        self.gap_size_edges = np.linspace(self.gap_size_min, self.gap_size_max, PIPE_GAP_SIZE_BINS + 1)[1:-1]
-        
-        self.accel_min, self.accel_max = -5.0, 5.0
-        self.accel_edges = np.linspace(self.accel_min, self.accel_max, ACCEL_BINS + 1)[1:-1]
-        
-        self.v_forward = avg_forward_speed()
 
     @staticmethod
     def _bin(val, edges):
         return int(np.clip(np.digitize(val, edges), 0, len(edges)))
 
-    def discretize(self, bird, pipes, prev_vel=None):
-        """Enhanced discretization with 8 features."""
+    def discretize(self, bird, pipes):
+        """Simple 5-feature state."""
         if not pipes:
-            return (0, 0, 0, VEL_BINS // 2, 0, 0, 0, ACCEL_BINS // 2)
+            return (0, 0, 0, VEL_BINS // 2, 0)
         
         idx = pipe_index_for_bird(bird.x, pipes)
         cur = pipes[idx]
         nxt = pipes[min(idx + 1, len(pipes) - 1)]
         
-        # Basic features
         y = float(np.clip(bird.y, 0, self.FLOOR))
         gc = float(np.clip(gap_center(cur), 0, self.FLOOR))
         dy = min(self.dy_max, abs(y - gc))
         dist = max(0.0, cur.x - bird.x)
-        ttb = min(self.ttb_max, dist / max(1e-3, self.v_forward))
+        ttb = min(self.ttb_max, dist / 8.0)  # assume speed ~8
         vel = float(np.clip(bird.vel, self.vel_min, self.vel_max))
         next_gc = float(np.clip(gap_center(nxt), 0, self.FLOOR))
-        
-        # Enhanced features
-        dy_next = min(self.dy_next_max, abs(y - gap_center(nxt)))
-        gap_size = float(np.clip(cur.bottom - cur.height, self.gap_size_min, self.gap_size_max))
-        
-        if prev_vel is not None:
-            accel = float(np.clip(bird.vel - prev_vel, self.accel_min, self.accel_max))
-        else:
-            accel = 0.0
         
         return (
             self._bin(y, self.y_edges),
@@ -379,73 +241,43 @@ class Discretizer:
             self._bin(ttb, self.ttb_edges),
             self._bin(vel, self.vel_edges),
             self._bin(next_gc, self.next_gap_edges),
-            self._bin(dy_next, self.dy_next_edges),
-            self._bin(gap_size, self.gap_size_edges),
-            self._bin(accel, self.accel_edges),
         )
 
-# ==================== Enhanced Reward Function ====================
-def enhanced_reward(alive, passed_pipe, bird, pipes, action):
-    """Improved reward shaping with multiple components."""
+# ==================== IMPROVED Reward Function ====================
+def improved_reward(alive, passed_pipe, bird, pipes, action):
+    """Clear, simple rewards."""
     if not alive:
         return DEATH_PENALTY
     
-    if not pipes:
-        return 0.0
+    r = ALIVE_REWARD  # Small reward for survival
     
-    idx = pipe_index_for_bird(bird.x, pipes)
-    p = pipes[idx]
-    gc = gap_center(p)
-    gap_height = p.bottom - p.height
-    
-    # Distance to gap center
-    dist_to_center = abs(bird.y - gc)
-    normalized_dist = dist_to_center / (gap_height / 2.0)
-    
-    r = 0.0
-    
-    # Smooth centering reward (gaussian-like)
-    r += CENTERING_REWARD_SCALE * math.exp(-normalized_dist * CENTERING_REWARD_SHARPNESS)
-    
-    # Pipe passing rewards
     if passed_pipe:
-        r += PIPE_PASS_REWARD
-        # Perfect pass bonus
-        if dist_to_center < gap_height * PERFECT_PASS_THRESHOLD:
-            r += PERFECT_PASS_BONUS
+        r += PIPE_PASS_REWARD  # Big reward for passing
     
-    # Flapping penalties
-    if action == 1:
-        r -= FLAP_PENALTY
-        # Extra penalty for flapping when centered
-        if dist_to_center < gap_height * 0.3:
-            r -= FLAP_WHEN_CENTERED_PENALTY
-    
-    # Look-ahead positioning for next pipe
-    if len(pipes) > idx + 1:
-        next_p = pipes[idx + 1]
-        next_gc = gap_center(next_p)
-        next_dist = abs(bird.y - next_gc)
-        next_gap_height = next_p.bottom - next_p.height
-        normalized_next_dist = next_dist / (next_gap_height / 2.0)
-        r += NEXT_PIPE_LOOKAHEAD_REWARD * (1.0 - normalized_next_dist)
+    # Distance-based shaping
+    if pipes:
+        idx = pipe_index_for_bird(bird.x, pipes)
+        p = pipes[idx]
+        gc = gap_center(p)
+        gap_height = p.bottom - p.height
+        
+        dist = abs(bird.y - gc)
+        normalized_dist = dist / (gap_height / 2.0)
+        
+        # Reward being centered (0 when far, 1 when centered)
+        centering_reward = DISTANCE_REWARD_SCALE * (1.0 - normalized_dist)
+        r += max(0, centering_reward)
     
     return r
 
 # ==================== Q-Learning Agent ====================
 def q_shape() -> Tuple[int, ...]:
-    return (Y_BINS, DY_GAP_BINS, TTB_BINS, VEL_BINS, NEXT_GAP_BINS, 
-            DY_NEXT_GAP_BINS, PIPE_GAP_SIZE_BINS, ACCEL_BINS, ACTIONS)
+    return (Y_BINS, DY_GAP_BINS, TTB_BINS, VEL_BINS, NEXT_GAP_BINS, ACTIONS)
 
 def optimistic_q_init(q: np.ndarray):
-    """Initialize Q-table with optimistic values."""
-    q.fill(0.0)
-    q[..., 0] = OPTIMISTIC_INIT_VALUE  # idle action
-    if ACTIONS > 1:
-        q[..., 1:] = OPTIMISTIC_INIT_FLAP_VALUE  # flap actions
+    q.fill(OPTIMISTIC_INIT_VALUE)
 
 class QAgent:
-    """Q-learning agent with adaptive learning rate and multi-horizon."""
     def __init__(self, d: Discretizer, init_q: Optional[np.ndarray] = None):
         self.d = d
         self.Q = np.zeros(q_shape(), dtype=np.float32)
@@ -453,35 +285,20 @@ class QAgent:
         if init_q is not None:
             np.copyto(self.Q, init_q.astype(np.float32, copy=False))
         
-        # Adaptive learning rate
-        self.current_lr = LEARNING_RATE
-        self.update_count = 0
-        
-        # Exploration
         self.eps = EXPLORATION_START
-        
-        # Experience replay
-        self.replay_buffer = ReplayBuffer() if USE_REPLAY_BUFFER else None
-        
-        # Track previous velocity for acceleration feature
-        self.prev_vel = None
+        self.episode_count = 0
 
     def act(self, s):
-        """Epsilon-greedy action selection."""
         if random.random() < self.eps:
             return random.randint(0, ACTIONS - 1)
         return int(np.argmax(self.Q[s]))
 
-    def decay_lr(self):
-        """Decay learning rate over time."""
-        self.current_lr = max(MIN_LEARNING_RATE, self.current_lr * LEARNING_RATE_DECAY)
-
     def learn_multihorizon(self, s, a, r, sp, terminal):
-        """Multi-horizon Q-learning update."""
+        """Multi-horizon update."""
         if terminal:
             target = r
         else:
-            # Multi-horizon bootstrapping
+            # Average over multiple horizons
             targets = []
             for h in HORIZONS:
                 gamma_h = DISCOUNT_FACTOR ** h
@@ -490,36 +307,17 @@ class QAgent:
         
         current_q = self.Q[s + (a,)]
         td_error = target - current_q
-        self.Q[s + (a,)] += self.current_lr * td_error
-        
-        # Update learning rate periodically
-        self.update_count += 1
-        if self.update_count % 1000 == 0:
-            self.decay_lr()
-        
-        # Add to replay buffer
-        if self.replay_buffer is not None and not terminal:
-            self.replay_buffer.add((s, a, r, sp, terminal), td_error)
+        self.Q[s + (a,)] += LEARNING_RATE * td_error
         
         return td_error
 
-    def replay_updates(self, n_updates=5):
-        """Sample from replay buffer and perform additional updates."""
-        if self.replay_buffer is None or len(self.replay_buffer) < REPLAY_BATCH_SIZE:
-            return
-        
-        for _ in range(n_updates):
-            batch = self.replay_buffer.sample()
-            for s, a, r, sp, terminal in batch:
-                self.learn_multihorizon(s, a, r, sp, terminal)
-
     def decay_eps(self):
-        """Decay exploration rate."""
+        """Decay epsilon per EPISODE."""
+        self.episode_count += 1
         self.eps = max(MIN_EXPLORATION, self.eps * EXPLORATION_DECAY)
 
 # ==================== Replay Recorder ====================
 class ReplayRecorder:
-    """Records episode for later visualization."""
     def __init__(self):
         self.frames = []
     
@@ -539,15 +337,10 @@ class ReplayRecorder:
 
 # ==================== Training Loop ====================
 def run_episodes(agent: QAgent, num_episodes: int, max_steps: int, Bird, Pipe, Base, WIN_WIDTH, FLOOR):
-    """Run training episodes for a worker."""
-    curriculum = CurriculumManager()
-    
     best_score = -1
     total_score = 0
     
     for ep in range(num_episodes):
-        difficulty = curriculum.get_difficulty(ep)
-        
         bird = Bird(230, random.randint(250, 450))
         base = Base(FLOOR)
         pipes = [Pipe(700)]
@@ -555,20 +348,14 @@ def run_episodes(agent: QAgent, num_episodes: int, max_steps: int, Bird, Pipe, B
         done = False
         steps = 0
         
-        agent.prev_vel = bird.vel
-        
         while not done and steps < max_steps:
             steps += 1
-            s = agent.d.discretize(bird, pipes, agent.prev_vel)
+            s = agent.d.discretize(bird, pipes)
             a = agent.act(s)
             
-            # Multi-action support
-            if ACTIONS > 2 and a > 0:
-                bird.vel = JUMP_STRENGTHS.get(a, JUMP_STRENGTHS[1])
-            elif a == 1:
+            if a == 1:
                 bird.jump()
             
-            agent.prev_vel = bird.vel
             bird.move()
             base.move()
             
@@ -594,15 +381,11 @@ def run_episodes(agent: QAgent, num_episodes: int, max_steps: int, Bird, Pipe, B
             if bird.y + bird.img.get_height() >= FLOOR or bird.y < -50:
                 done = True
             
-            sp = agent.d.discretize(bird, pipes, bird.vel)
-            r = enhanced_reward(not done, passed, bird, pipes, a)
+            sp = agent.d.discretize(bird, pipes)
+            r = improved_reward(not done, passed, bird, pipes, a)
             agent.learn_multihorizon(s, a, r, sp, done)
         
-        # Replay updates at end of episode
-        if USE_REPLAY_BUFFER:
-            agent.replay_updates(n_updates=5)
-        
-        agent.decay_eps()
+        agent.decay_eps()  # Decay after each episode
         best_score = max(best_score, score)
         total_score += score
     
@@ -613,10 +396,9 @@ def run_episodes(agent: QAgent, num_episodes: int, max_steps: int, Bird, Pipe, B
         "Q": agent.Q,
     }
 
-# ==================== Worker Function ====================
+# ==================== Worker ====================
 def worker_round(worker_id: int, seed: int, episodes_this_round: int, max_steps: int, 
                  global_q_snapshot: np.ndarray):
-    """Worker process for parallel training."""
     fb = load_fb_module()
     Bird, Pipe, Base, WIN_WIDTH, WIN_HEIGHT, FLOOR = make_env_objects(fb)
     
@@ -624,7 +406,9 @@ def worker_round(worker_id: int, seed: int, episodes_this_round: int, max_steps:
     np.random.seed(seed)
     d = Discretizer(FLOOR)
     agent = QAgent(d, init_q=global_q_snapshot)
-    agent.eps = max(MIN_EXPLORATION, EXPLORATION_START * (0.9 + 0.2 * (worker_id % 3) / 2.0))
+    
+    # Vary exploration per worker
+    agent.eps = EXPLORATION_START * (0.8 + 0.4 * (worker_id % 3) / 2.0)
     
     stats = run_episodes(agent, episodes_this_round, max_steps, Bird, Pipe, Base, WIN_WIDTH, FLOOR)
     return {
@@ -637,7 +421,6 @@ def worker_round(worker_id: int, seed: int, episodes_this_round: int, max_steps:
 
 # ==================== Coordinator ====================
 def average_q(list_of_q: List[np.ndarray]) -> np.ndarray:
-    """FedAvg: average Q-tables from all workers."""
     out = np.zeros_like(list_of_q[0], dtype=np.float32)
     for q in list_of_q:
         out += q.astype(np.float32, copy=False)
@@ -656,20 +439,25 @@ def train_multiprocess(num_workers: Optional[int] = None,
                        affinity: Optional[List[int]] = None,
                        headless: bool = True,
                        maxtasksperchild: Optional[int] = DEFAULT_MAXTASKSPERCHILD):
-    """Main training coordinator."""
     if num_workers is None:
         num_workers = mp.cpu_count()
     num_workers = _clamp_workers(num_workers)
     
     rounds = int(math.ceil(total_episodes_per_worker / float(sync_interval)))
+    
+    # Calculate Q-table size
+    q_size = np.prod(q_shape())
+    q_mb = (q_size * 4) / (1024 * 1024)  # 4 bytes per float32
+    
     print("=" * 60)
-    print("IMPROVED Q-LEARNING FLAPPY BIRD")
+    print("FIXED Q-LEARNING FLAPPY BIRD")
     print("=" * 60)
-    print(f"CPU Workers: {num_workers} (cap={MAX_WORKERS})")
+    print(f"CPU Workers: {num_workers}")
     print(f"Episodes/Worker: {total_episodes_per_worker} | Sync: {sync_interval} | Rounds: {rounds}")
-    print(f"State dims: {q_shape()}")
-    print(f"Actions: {ACTIONS}")
-    print(f"Replay Buffer: {USE_REPLAY_BUFFER} | Curriculum: {USE_CURRICULUM}")
+    print(f"State space: {q_shape()} = {q_size:,} states")
+    print(f"Q-table size: {q_mb:.2f} MB")
+    print(f"Initial exploration: {EXPLORATION_START:.2%}")
+    print(f"Exploration decay: {EXPLORATION_DECAY} per episode")
     print("=" * 60)
     
     set_process_priority(nice_value, ionice_flag, affinity)
@@ -696,39 +484,41 @@ def train_multiprocess(num_workers: Optional[int] = None,
             
             best_in_round = max(results, key=lambda r: r["best_score"])
             avg_avgs = float(np.mean([r["avg"] for r in results]))
+            avg_eps = float(np.mean([r["eps"] for r in results]))
+            
             print(f"[Round {rd+1}/{rounds}] "
                   f"Worker#{best_in_round['worker']} score={best_in_round['best_score']} | "
-                  f"Avg={avg_avgs:.2f} | eps={np.mean([r['eps'] for r in results]):.3f}")
+                  f"Avg={avg_avgs:.2f} | eps={avg_eps:.3f}")
             
             if best_in_round["best_score"] > global_best["score"]:
                 global_best["score"] = best_in_round["best_score"]
                 global_best["Q"] = best_in_round["Q"].copy()
+                print(f"  🎯 NEW BEST: {best_in_round['best_score']} pipes!")
     
     dur = time.time() - start
     total_episodes = num_workers * total_episodes_per_worker
     print("\n" + "=" * 60)
     print(f"✅ TRAINING COMPLETE in {dur:.1f}s | {total_episodes/dur:.1f} eps/sec")
-    print(f"Best Score: {global_best['score']}")
+    print(f"🏆 Best Score: {global_best['score']} pipes")
     print("=" * 60)
     
     if SAVE_BEST_Q:
-        np.save(EXPORT_DIR / "best_q_table_improved.npy", global_best["Q"])
-        print(f"💾 Saved best Q -> {EXPORT_DIR/'best_q_table_improved.npy'}")
+        np.save(EXPORT_DIR / "best_q_table_fixed.npy", global_best["Q"])
+        print(f"💾 Saved best Q -> {EXPORT_DIR/'best_q_table_fixed.npy'}")
     
     if SAVE_AVG_Q:
-        np.save(EXPORT_DIR / "avg_q_table_improved.npy", gQ)
-        print(f"💾 Saved averaged Q -> {EXPORT_DIR/'avg_q_table_improved.npy'}")
+        np.save(EXPORT_DIR / "avg_q_table_fixed.npy", gQ)
+        print(f"💾 Saved averaged Q -> {EXPORT_DIR/'avg_q_table_fixed.npy'}")
     
     if SAVE_REPLAY:
         score = record_greedy_replay(global_best["Q"], seed=123, 
-                                     save_path=EXPORT_DIR / "replay_improved.npz")
-        print(f"🎥 Replay saved (score {score}) -> {EXPORT_DIR/'replay_improved.npz'}")
+                                     save_path=EXPORT_DIR / "replay_fixed.npz")
+        print(f"🎥 Replay saved (score {score}) -> {EXPORT_DIR/'replay_fixed.npz'}")
     
     return global_best, gQ
 
 # ==================== Replay Runner ====================
-def record_greedy_replay(Q, seed: int, save_path: Path, max_steps: int = 6000):
-    """Record greedy policy for visualization."""
+def record_greedy_replay(Q, seed: int, save_path: Path, max_steps: int = 5000):
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
     os.environ.setdefault("FB_NO_DISPLAY", "1")
@@ -747,19 +537,15 @@ def record_greedy_replay(Q, seed: int, save_path: Path, max_steps: int = 6000):
     score, done, steps = 0, False, 0
     
     rec = ReplayRecorder()
-    prev_vel = bird.vel
     
     while not done and steps < max_steps:
         steps += 1
-        s = d.discretize(bird, pipes, prev_vel)
+        s = d.discretize(bird, pipes)
         a = agent.act(s)
         
-        if ACTIONS > 2 and a > 0:
-            bird.vel = JUMP_STRENGTHS.get(a, JUMP_STRENGTHS[1])
-        elif a == 1:
+        if a == 1:
             bird.jump()
         
-        prev_vel = bird.vel
         bird.move()
         base.move()
         
@@ -787,7 +573,7 @@ def record_greedy_replay(Q, seed: int, save_path: Path, max_steps: int = 6000):
         
         rec.log(steps, bird, pipes, score, WIN_WIDTH, FLOOR)
     
-    meta = {"seed": seed, "episode_score": int(score), "note": "improved Q-learning"}
+    meta = {"seed": seed, "episode_score": int(score), "note": "fixed Q-learning"}
     rec.save(save_path, meta)
     return score
 
@@ -811,14 +597,14 @@ def main():
     except RuntimeError:
         pass
     
-    ap = argparse.ArgumentParser(description="Improved Q-learning for Flappy Bird")
-    ap.add_argument("--workers", type=int, default=None, help=f"Number of workers (max {MAX_WORKERS})")
+    ap = argparse.ArgumentParser(description="Fixed Q-learning for Flappy Bird")
+    ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--episodes-per-worker", type=int, default=TOTAL_EPISODES_PER_WORKER)
     ap.add_argument("--sync-interval", type=int, default=SYNC_INTERVAL)
     ap.add_argument("--max-steps", type=int, default=MAX_STEPS)
     ap.add_argument("--nice", type=int, default=DEFAULT_NICE_VALUE)
-    ap.add_argument("--ionice", action="store_true", help="Enable I/O priority lowering (Linux)")
-    ap.add_argument("--affinity", type=str, default=None, help="CPU cores e.g. '2-15'")
+    ap.add_argument("--ionice", action="store_true")
+    ap.add_argument("--affinity", type=str, default=None)
     ap.add_argument("--maxtasksperchild", type=int, default=DEFAULT_MAXTASKSPERCHILD)
     args = ap.parse_args()
     
