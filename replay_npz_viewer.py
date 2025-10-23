@@ -1,316 +1,386 @@
-# file: replay_npz_viewer.py
+# file: v6_optimized.py
 """
-Replay a recorded Flappy Bird .npz using the same assets as flappy_bird.py,
-with optional gap-midline overlay and reconstruction of all on-screen pipes.
+OPTIMIZED DQN for Flappy Bird
 
-Usage:
-  python replay_npz_viewer.py exports/replay_best_multih.npz --fps 30 --loop --overlay --reconstruct-all --loss-weight 0.02
-
-Keys:
-  Space pause/resume | ←/→ step | +/- speed | R restart | L loop | Esc/Q quit
+Changes from v6.py:
+1. Cleaner epsilon decay schedule
+2. Simplified reward function
+3. Better hyperparameters
+4. More training episodes
 """
-import argparse
-import json
-import os
-from pathlib import Path
 
+import random
+from collections import deque
 import numpy as np
 import pygame
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 
-# Match your game constants
-WIN_WIDTH = 600
-WIN_HEIGHT = 800
-FLOOR = 730
-ANIMATION_TIME = 5
-MAX_ROTATION = 25
-ROT_VEL = 20
-PIPE_VISUAL_WIDTH = 52  # sprite width, visual only
+from flappy_bird_easy import Bird, Pipe, Base, WIN_WIDTH, WIN_HEIGHT, FLOOR
 
-# ---------- Assets ----------
-def load_assets(img_dir="imgs"):
-    pipe_img = pygame.transform.scale2x(
-        pygame.image.load(os.path.join(img_dir, "pipe.png")).convert_alpha()
-    )
-    pipe_top_img = pygame.transform.flip(pipe_img, False, True)
-    bg_img = pygame.transform.scale(
-        pygame.image.load(os.path.join(img_dir, "bg.png")).convert_alpha(), (600, 900)
-    )
-    bird_images = [
-        pygame.transform.scale2x(pygame.image.load(os.path.join(img_dir, f"bird{x}.png"))).convert_alpha()
-        for x in range(1, 3 + 1)
-    ]
-    base_img = pygame.transform.scale2x(
-        pygame.image.load(os.path.join(img_dir, "base.png")).convert_alpha()
-    )
-    return {
-        "pipe_bottom": pipe_img,
-        "pipe_top": pipe_top_img,
-        "bg": bg_img,
-        "birds": bird_images,
-        "base": base_img,
-    }
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Optimized DQN Agent for Flappy Bird")
+print(f"Using device: {device}")
 
-# ---------- NPZ ----------
-def load_replay(npz_path: Path):
-    data = np.load(str(npz_path))
-    meta = json.loads(data["meta"].tobytes().decode("utf-8"))
-    return {
-        "t": data["t"],
-        "bx": data["bx"],
-        "by": data["by"],
-        "bv": data.get("bv"),
-        "score": data["score"],
-        "cur_px": data["cur_px"],
-        "cur_height": data["cur_top"],   # recorded as pipe.height
-        "cur_bottom": data["cur_bot"],   # recorded as pipe.bottom
-        "nxt_px": data["nxt_px"],
-        "nxt_height": data["nxt_top"],
-        "nxt_bottom": data["nxt_bot"],
-        "meta": meta,
-    }
+# ==================== OPTIMIZED HYPERPARAMETERS ====================
 
-# ---------- Helpers ----------
-def infer_pipe_vel(px_series):
-    if len(px_series) < 2:
-        return 5.0
-    diffs = np.diff(px_series[: min(16, len(px_series))])
-    v = np.median(-diffs)
-    return float(v if np.isfinite(v) and v > 0 else 5.0)
+# Training
+FPS_TRAIN = 0  # No frame limiting - train as fast as possible!
+MAX_STEPS = 2000  # Slightly reduced
+EPISODES = 12000  # Reduced but still plenty
 
-def gap_center(height_val, bottom_val):
-    return 0.5 * (float(height_val) + float(bottom_val))
+# Replay Buffer
+BUFFER_SIZE = 100_000
+BATCH_SIZE = 64
 
-class BaseScroller:
-    def __init__(self, base_img, init_vel=5.0):
-        self.IMG = base_img
-        self.WIDTH = base_img.get_width()
-        self.y = FLOOR
-        self.x1 = 0
-        self.x2 = self.WIDTH
-        self.vel = init_vel
+# Learning
+GAMMA = 0.99
+LR = 1e-4
+TAU = 0.005
+N_STEPS = 3
 
-    def set_vel(self, vel): self.vel = max(1.0, float(vel))
+# Regularization - Prevent overfitting
+L1_LAMBDA = 1e-5  # L1 (Lasso) regularization strength
+L2_LAMBDA = 1e-4  # L2 (Ridge) regularization strength (weight decay)
 
-    def move(self):
-        self.x1 -= self.vel
-        self.x2 -= self.vel
-        if self.x1 + self.WIDTH < 0: self.x1 = self.x2 + self.WIDTH
-        if self.x2 + self.WIDTH < 0: self.x2 = self.x1 + self.WIDTH
+# Early Stopping - Stop when model stops improving
+EARLY_STOP_PATIENCE = 2000  # Stop if no improvement for 2000 episodes
+EARLY_STOP_MIN_DELTA = 1.0   # Minimum improvement in avg score to count
+EVAL_WINDOW = 100            # Evaluate average over last 100 episodes
 
-    def draw(self, win):
-        win.blit(self.IMG, (self.x1, self.y))
-        win.blit(self.IMG, (self.x2, self.y))
+# Epsilon - LINEAR DECAY (cleaner than exponential)
+EPS_START = 1.0
+EPS_END = 0.05
+EPS_DECAY_STEPS = 8000  # Reach minimum after 8k episodes (was 10k)
 
-class BirdSprite:
-    def __init__(self, bird_imgs):
-        self.IMGS = bird_imgs
-        self.img = self.IMGS[0]
-        self.img_count = 0
-        self.tilt = 0
+# Rewards - SIMPLIFIED
+REWARD_DEATH = -1.0
+REWARD_PASS_PIPE = 1.0
+REWARD_ALIVE = 0.01
+REWARD_CENTER_WEIGHT = 0.1  # Small bonus for staying centered
 
-    def update(self, vel_y):
-        self.img_count += 1
-        if self.img_count <= ANIMATION_TIME:
-            self.img = self.IMGS[0]
-        elif self.img_count <= ANIMATION_TIME * 2:
-            self.img = self.IMGS[1]
-        elif self.img_count <= ANIMATION_TIME * 3:
-            self.img = self.IMGS[2]
-        elif self.img_count <= ANIMATION_TIME * 4:
-            self.img = self.IMGS[1]
+# =================================================================
+
+class DuelingDQN(nn.Module):
+    """Same excellent architecture from v6.py"""
+    def __init__(self, input_dim=6, hidden=128, output_dim=2):
+        super().__init__()
+        self.feature = nn.Sequential(
+            nn.Linear(input_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self.val = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+        self.adv = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, output_dim),
+        )
+
+    def forward(self, x):
+        f = self.feature(x)
+        v = self.val(f)
+        a = self.adv(f)
+        return v + (a - a.mean(dim=1, keepdim=True))
+
+
+class DQNAgent:
+    def __init__(self):
+        self.q_net = DuelingDQN().to(device)
+        self.target_net = DuelingDQN().to(device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(
+            self.q_net.parameters(), 
+            lr=LR,
+            weight_decay=L2_LAMBDA  # L2 regularization via weight decay
+        )
+        self.memory = deque(maxlen=BUFFER_SIZE)
+        self.nstep_buf = deque(maxlen=N_STEPS)
+
+        self.gamma = GAMMA
+        self.batch_size = BATCH_SIZE
+        self.tau = TAU
+        self.train_steps = 0
+        
+        self.episode = 0
+
+    def get_epsilon(self):
+        """LINEAR epsilon decay - cleaner than exponential"""
+        if self.episode >= EPS_DECAY_STEPS:
+            return EPS_END
+        
+        # Linear interpolation
+        progress = self.episode / EPS_DECAY_STEPS
+        return EPS_START - (EPS_START - EPS_END) * progress
+
+    def get_state(self, bird, pipes):
+        """Same excellent 6-feature state from v6.py"""
+        pipe_idx = 0
+        if len(pipes) > 1 and bird.x > pipes[0].x + pipes[0].PIPE_TOP.get_width():
+            pipe_idx = 1
+        
+        top = pipes[pipe_idx].height
+        bottom = pipes[pipe_idx].bottom
+        gap_center = 0.5 * (top + bottom)
+        dx = pipes[pipe_idx].x - bird.x
+
+        return np.array([
+            bird.y / WIN_HEIGHT,
+            abs(bird.y - top) / WIN_HEIGHT,
+            abs(bird.y - bottom) / WIN_HEIGHT,
+            (bird.y - gap_center) / WIN_HEIGHT,
+            bird.vel / 16.0,
+            dx / WIN_WIDTH,
+        ], dtype=np.float32)
+
+    def choose_action(self, state):
+        epsilon = self.get_epsilon()
+        
+        if random.random() < epsilon:
+            return random.randint(0, 1)
+        
+        s = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        with torch.no_grad():
+            q = self.q_net(s)
+        return int(q.argmax().item())
+
+    def _append_nstep(self, s, a, r, sn, done):
+        """Same N-step logic from v6.py"""
+        self.nstep_buf.append((s, a, r, sn, done))
+        if len(self.nstep_buf) < N_STEPS and not done:
+            return None
+        
+        R, s0, a0 = 0.0, self.nstep_buf[0][0], self.nstep_buf[0][1]
+        sN, dN = (sn, done)
+        
+        for i, (_, _, ri, s_i1, d_i1) in enumerate(self.nstep_buf):
+            R += (self.gamma ** i) * ri
+            if d_i1:
+                sN, dN = s_i1, d_i1
+                break
+        
+        if sN is None:
+            sN = np.zeros_like(s0)
+        return (s0, a0, R, sN, dN)
+
+    def remember(self, s, a, r, sn, done):
+        tr = self._append_nstep(s, a, r, sn, done)
+        if tr is not None:
+            self.memory.append(tr)
+        if done:
+            self.nstep_buf.clear()
         else:
-            self.img = self.IMGS[0]; self.img_count = 0
+            while len(self.nstep_buf) > N_STEPS - 1:
+                self.nstep_buf.popleft()
 
-        vy = 0.0 if vel_y is None else float(vel_y)
-        if vy < -1.0: self.tilt = min(MAX_ROTATION, self.tilt + ROT_VEL)
-        else:         self.tilt = max(-90, self.tilt - ROT_VEL)
+    def soft_update(self):
+        with torch.no_grad():
+            for tp, p in zip(self.target_net.parameters(), self.q_net.parameters()):
+                tp.data.mul_(1.0 - self.tau).add_(self.tau * p.data)
 
-    @staticmethod
-    def blit_rotate_center(surf, image, topleft, angle):
-        rotated_image = pygame.transform.rotate(image, angle)
-        new_rect = rotated_image.get_rect(center=image.get_rect(topleft=topleft).center)
-        surf.blit(rotated_image, new_rect.topleft)
+    def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+        
+        batch = random.sample(self.memory, self.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        s = torch.tensor(states, dtype=torch.float32, device=device)
+        a = torch.tensor(actions, dtype=torch.long, device=device)
+        r = torch.tensor(rewards, dtype=torch.float32, device=device).clamp_(-5.0, 5.0)
+        sn = torch.tensor(next_states, dtype=torch.float32, device=device)
+        d = torch.tensor(dones, dtype=torch.bool, device=device)
 
-    def draw(self, win, x, y):
-        img = self.IMGS[1] if self.tilt <= -80 else self.img
-        self.blit_rotate_center(win, img, (float(x), float(y)), self.tilt)
+        with torch.no_grad():
+            # Double DQN
+            next_actions = self.q_net(sn).argmax(1)
+            next_q = self.target_net(sn).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            target_q = r + (self.gamma ** N_STEPS) * next_q * (~d)
 
-def draw_pipe_pair(win, assets, px, height_value, bottom_value):
-    if not np.isfinite(px): return
-    pipe_top = assets["pipe_top"]
-    pipe_bottom = assets["pipe_bottom"]
-    top_y = float(height_value) - pipe_top.get_height()
-    bottom_y = float(bottom_value)
-    win.blit(pipe_top, (float(px), top_y))
-    win.blit(pipe_bottom, (float(px), bottom_y))
+        q_sa = self.q_net(s).gather(1, a.unsqueeze(1)).squeeze(1)
+        loss = F.smooth_l1_loss(q_sa, target_q)
+        
+        # Add L1 regularization (Lasso)
+        if L1_LAMBDA > 0:
+            l1_norm = sum(p.abs().sum() for p in self.q_net.parameters())
+            loss = loss + L1_LAMBDA * l1_norm
 
-def reconstruct_all_pipes(cur_px, cur_h, cur_b, nxt_px, nxt_h, nxt_b):
-    """Linear extrapolation: spacing & heights from (cur, next)."""
-    pipes = []
-    # Start with the two we have
-    pipes.append((float(cur_px), float(cur_h), float(cur_b)))
-    pipes.append((float(nxt_px), float(nxt_h), float(nxt_b)))
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.q_net.parameters(), 1.0)
+        self.optimizer.step()
 
-    spacing = float(nxt_px - cur_px)
-    dh = float(nxt_h - cur_h)
-    db = float(nxt_b - cur_b)
+        self.soft_update()
+        self.train_steps += 1
 
-    # Guard
-    if not np.isfinite(spacing) or spacing <= 5:
-        spacing = 200.0  # fallback
-    if not np.isfinite(dh): dh = 0.0
-    if not np.isfinite(db): db = 0.0
+        if self.train_steps % 500 == 0:
+            with torch.no_grad():
+                mean_q = self.q_net(s).mean().item()
+            eps = self.get_epsilon()
+            print(f"[Step {self.train_steps:5d}] Loss={loss.item():.4f} | MeanQ={mean_q:.2f} | ε={eps:.3f} | Mem={len(self.memory)}")
 
-    # Extrapolate to the right (on-screen only)
-    px, h, b = float(nxt_px), float(nxt_h), float(nxt_b)
-    for _ in range(6):  # a few more possible pipes
-        px += spacing
-        h += dh
-        b += db
-        if px - PIPE_VISUAL_WIDTH > WIN_WIDTH + 10:
-            break
-        pipes.append((px, h, b))
 
-    # Optionally backfill to the left (only if still visible)
-    px, h, b = float(cur_px), float(cur_h), float(cur_b)
-    for _ in range(2):
-        px -= spacing
-        h -= dh
-        b -= db
-        if px + PIPE_VISUAL_WIDTH < -10:
-            break
-        pipes.append((px, h, b))
+def compute_reward(alive, passed_pipe, bird, pipes, action):
+    """SIMPLIFIED reward function"""
+    if not alive:
+        return REWARD_DEATH
+    
+    reward = REWARD_ALIVE
+    
+    if passed_pipe:
+        reward += REWARD_PASS_PIPE
+    
+    # Small bonus for staying near gap center
+    if pipes:
+        pipe_idx = 0
+        if len(pipes) > 1 and bird.x > pipes[0].x + pipes[0].PIPE_TOP.get_width():
+            pipe_idx = 1
+        
+        top = pipes[pipe_idx].height
+        bottom = pipes[pipe_idx].bottom
+        gap_center = 0.5 * (top + bottom)
+        gap_height = bottom - top
+        
+        distance_from_center = abs(bird.y - gap_center)
+        normalized_dist = distance_from_center / (gap_height / 2.0)
+        
+        # Reward being centered (max +0.1)
+        centering_bonus = REWARD_CENTER_WEIGHT * (1.0 - min(1.0, normalized_dist))
+        reward += centering_bonus
+    
+    return float(np.clip(reward, -5.0, 5.0))
 
-    # Keep visible pipes, sorted by x
-    pipes = [p for p in pipes if -PIPE_VISUAL_WIDTH <= p[0] <= WIN_WIDTH + PIPE_VISUAL_WIDTH]
-    pipes.sort(key=lambda tup: tup[0])
-    return pipes
 
-# ---------- Main ----------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("npz", type=str, help="Path to replay .npz")
-    ap.add_argument("--fps", type=int, default=30, help="Playback FPS")
-    ap.add_argument("--loop", action="store_true", help="Loop playback")
-    ap.add_argument("--imgdir", type=str, default="imgs", help="Assets directory")
-    ap.add_argument("--overlay", action="store_true", help="Show gap midline + distance/loss")
-    ap.add_argument("--loss-weight", type=float, default=0.0, help="Optional loss weight to show weighted loss")
-    ap.add_argument("--reconstruct-all", action="store_true", help="Draw all on-screen pipes (extrapolated)")
-    args = ap.parse_args()
+def train_dqn(episodes=EPISODES):
+    print("=" * 60)
+    print(f"Training for up to {episodes} episodes")
+    print(f"Epsilon: {EPS_START:.2f} → {EPS_END:.2f} over {EPS_DECAY_STEPS} episodes")
+    print(f"Regularization: L1={L1_LAMBDA:.0e}, L2={L2_LAMBDA:.0e}")
+    print(f"Early stopping: patience={EARLY_STOP_PATIENCE}, min_delta={EARLY_STOP_MIN_DELTA}")
+    print("=" * 60)
+    
+    agent = DQNAgent()
+    scores = []
+    best_score = 0
+    
+    # Early stopping tracking
+    best_avg_score = 0
+    episodes_without_improvement = 0
+    stopped_early = False
 
-    npz_path = Path(args.npz)
-    if not npz_path.exists():
-        raise FileNotFoundError(npz_path)
+    for ep in range(episodes):
+        agent.episode = ep
+        
+        bird = Bird(230, random.randint(250, 450))
+        base = Base(FLOOR)
+        pipes = [Pipe(700)]
+        score, done, steps = 0, False, 0
+        state = agent.get_state(bird, pipes)
+        clock = pygame.time.Clock()
 
-    pygame.init()
-    pygame.display.set_caption("Flappy Bird Replay (game assets)")
-    win = pygame.display.set_mode((WIN_WIDTH, WIN_HEIGHT))
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont("comicsans", 22)
+        while not done and steps < MAX_STEPS:
+            steps += 1
+            # No FPS limiting - train as fast as possible!
 
-    assets = load_assets(args.imgdir)
-    bg = assets["bg"]
-    base = BaseScroller(assets["base"], init_vel=5.0)
-    bird_sprite = BirdSprite(assets["birds"])
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    return
 
-    R = load_replay(npz_path)
-    t = R["t"]; bx = R["bx"]; by = R["by"]; bv = R["bv"]; score = R["score"]
-    cur_px = R["cur_px"]; cur_h = R["cur_height"]; cur_b = R["cur_bottom"]
-    nxt_px = R["nxt_px"]; nxt_h = R["nxt_height"]; nxt_b = R["nxt_bottom"]
-    meta = R["meta"]
+            action = agent.choose_action(state)
+            if action == 1:
+                bird.jump()
 
-    base.set_vel(infer_pipe_vel(cur_px))
+            bird.move()
+            base.move()
 
-    i = 0
-    playing = True
-    fps = max(1, int(args.fps))
-    loop = bool(args.loop)
+            rem, add_pipe = [], False
+            for pipe in pipes:
+                pipe.move()
+                if pipe.collide(bird, None):
+                    done = True
+                    break
+                if pipe.x + pipe.PIPE_TOP.get_width() < 0:
+                    rem.append(pipe)
+                if not pipe.passed and pipe.x < bird.x:
+                    pipe.passed = True
+                    add_pipe = True
 
-    def draw_overlay_for_current(idx):
-        # Midline from current pipe
-        gc = gap_center(cur_h[idx], cur_b[idx])
-        loss_px = abs(float(by[idx]) - gc)
-        # Horizontal midline
-        pygame.draw.line(win, (255, 200, 0), (0, int(gc)), (WIN_WIDTH, int(gc)), 2)
-        # Bird→midline connector
-        pygame.draw.line(win, (255, 100, 100),
-                         (int(bx[idx]), int(by[idx])),
-                         (int(bx[idx]), int(gc)), 2)
-        # Label
-        txt = f"dist={loss_px:.1f}px"
-        if args.loss_weight > 0:
-            txt += f"  loss={args.loss_weight*loss_px:.3f}"
-        surf = font.render(txt, True, (255, 255, 255))
-        win.blit(surf, (10, WIN_HEIGHT - 30))
+            if add_pipe:
+                score += 1
+                pipes.append(Pipe(WIN_WIDTH))
+            
+            for r in rem:
+                pipes.remove(r)
 
-    def draw_frame(idx: int):
-        win.blit(bg, (0, 0))
+            if bird.y + bird.img.get_height() >= FLOOR or bird.y < -50:
+                done = True
 
-        if args.reconstruct_all:
-            pipe_list = reconstruct_all_pipes(cur_px[idx], cur_h[idx], cur_b[idx],
-                                              nxt_px[idx], nxt_h[idx], nxt_b[idx])
-            for (px, h, b) in pipe_list:
-                draw_pipe_pair(win, assets, px, h, b)
-        else:
-            draw_pipe_pair(win, assets, cur_px[idx], cur_h[idx], cur_b[idx])
-            draw_pipe_pair(win, assets, nxt_px[idx], nxt_h[idx], nxt_b[idx])
+            reward = compute_reward(not done, add_pipe, bird, pipes, action)
+            next_state = agent.get_state(bird, pipes) if not done else None
 
-        vy = float(bv[idx]) if (bv is not None and idx < len(bv)) else 0.0
-        bird_sprite.update(vy)
-        bird_sprite.draw(win, float(bx[idx]), float(by[idx]))
+            agent.remember(state, action, reward, next_state, done)
+            agent.replay()
+            state = next_state
 
-        base.move()
-        base.draw(win)
+        scores.append(score)
+        avg_window = np.mean(scores[-EVAL_WINDOW:]) if len(scores) >= EVAL_WINDOW else np.mean(scores)
+        
+        # Update best score
+        if score > best_score:
+            best_score = score
+            torch.save(agent.q_net.state_dict(), "dqn_flappy_optimized_best.pth")
 
-        # HUD
-        hud = [
-            f"t={int(t[idx])}",
-            f"score={int(score[idx])}",
-            f"fps={fps}",
-            f"seed={meta.get('seed','?')}",
-            f"{'LOOP' if loop else ''} {'PAUSED' if not playing else ''}"
-        ]
-        y = 8
-        for line in hud:
-            win.blit(font.render(line, True, (255, 255, 255)), (10, y))
-            y += 22
+        # Early stopping check
+        if len(scores) >= EVAL_WINDOW:
+            if avg_window > best_avg_score + EARLY_STOP_MIN_DELTA:
+                # Significant improvement!
+                best_avg_score = avg_window
+                episodes_without_improvement = 0
+            else:
+                # No significant improvement
+                episodes_without_improvement += 1
+            
+            # Check if we should stop
+            if episodes_without_improvement >= EARLY_STOP_PATIENCE:
+                print(f"\n{'='*60}")
+                print(f"⏹️  EARLY STOPPING at episode {ep}")
+                print(f"No improvement for {EARLY_STOP_PATIENCE} episodes")
+                print(f"Best avg score: {best_avg_score:.2f}")
+                print(f"{'='*60}\n")
+                stopped_early = True
+                break
 
-        if args.overlay:
-            draw_overlay_for_current(idx)
+        if ep % 100 == 0:
+            eps = agent.get_epsilon()
+            patience_info = f" | NoImprove={episodes_without_improvement}/{EARLY_STOP_PATIENCE}" if len(scores) >= EVAL_WINDOW else ""
+            print(f"Ep {ep:5d} | Score: {score:3d} | Avg{EVAL_WINDOW}: {avg_window:.2f} | Best: {best_score:3d} | ε={eps:.3f}{patience_info}")
 
-        pygame.display.update()
+        if ep % 1000 == 0 and ep > 0:
+            torch.save(agent.q_net.state_dict(), f"dqn_flappy_optimized_ep{ep}.pth")
+            print(f"  💾 Checkpoint saved")
 
-    while True:
-        clock.tick(fps)
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit(); return
-            if event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    pygame.quit(); return
-                if event.key == pygame.K_SPACE:
-                    playing = not playing
-                if event.key == pygame.K_LEFT:
-                    i = max(0, i - 1)
-                if event.key == pygame.K_RIGHT:
-                    i = min(len(t) - 1, i + 1)
-                if event.key in (pygame.K_PLUS, pygame.K_EQUALS):
-                    fps = min(240, fps + 5)
-                if event.key in (pygame.K_MINUS, pygame.K_UNDERSCORE):
-                    fps = max(1, fps - 5)
-                if event.key == pygame.K_r:
-                    i = 0; playing = True
-                if event.key == pygame.K_l:
-                    loop = not loop
+    # Save final model
+    torch.save(agent.q_net.state_dict(), "dqn_flappy_optimized_final.pth")
+    
+    print("\n" + "=" * 60)
+    if stopped_early:
+        print(f"✅ Training stopped early at episode {ep} (saved time!)")
+    else:
+        print(f"✅ Training complete - all {episodes} episodes")
+    print(f"🏆 Best Score: {best_score}")
+    print(f"📊 Best Avg{EVAL_WINDOW}: {best_avg_score:.2f}")
+    print(f"📈 Final Avg{EVAL_WINDOW}: {avg_window:.2f}")
+    print("=" * 60)
 
-        if playing:
-            i += 1
-            if i >= len(t):
-                if loop: i = 0
-                else: playing = False; i = len(t) - 1
-
-        i = max(0, min(i, len(t) - 1))
-        draw_frame(i)
 
 if __name__ == "__main__":
-    main()
+    pygame.init()
+    train_dqn(episodes=EPISODES)
